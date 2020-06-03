@@ -1,25 +1,42 @@
-﻿using System;
+﻿// Ignition ArcGIS IoT Publisher
+// Copyright (c) 2020 Esri Canada
+
+using System;
 using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System.Globalization;
 using System.IO;
+using System.Linq;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Threading;
+using System.Threading.Tasks;
+
+using Anywhere.ArcGIS;
+using Anywhere.ArcGIS.Operation;
+using Anywhere.ArcGIS.Common;
+
 using Google.Apis.Auth.OAuth2;
-using Google.Cloud.BigQuery.V2;
 using Google.Apis.Bigquery.v2.Data;
+
 using McMaster.Extensions.CommandLineUtils;
+
 using MQTTnet;
 using MQTTnet.Client.Options;
 using MQTTnet.Client.Connecting;
 using MQTTnet.Client.Publishing;
 using MQTTnet.Extensions.ManagedClient;
-using Anywhere.ArcGIS;
-using Anywhere.ArcGIS.Operation;
-using Anywhere.ArcGIS.Common;
-using System.Threading;
-using Newtonsoft.Json;
-using System.Security.Cryptography.X509Certificates;
-using System.Net.Security;
+
+using Newtonsoft.Json; // Anywhere.ArcGIS uses DataContract, not supported by System.Text.Json
+
+using Google.Cloud.BigQuery.V2;
+
+// Note that Anywhere.ArcGIS is not able to write directly to an Analytics for IoT hosted
+// feature service, due to some incompatible URL path manipulation it does under the hood,
+// resulting in an exception being thrown, which cryptically reports a JSON reader error
+// (because the result being parsed is an HTML error page)
+//
+// One thing it does quite well is to request and refresh a token for Server or Online. If
+// low-level JSON REST calls were used instead, this token facility could still be used.
 
 namespace IgnitionIoTMessagePublisher
 {
@@ -35,7 +52,7 @@ namespace IgnitionIoTMessagePublisher
         [Option("-q|--query-sql-file", Description = "Path to SQL query file - if specified, takes precedence over constructing a query from other arguments. All listed fields must be listed in the defined SQL, aliased if necessary to match exactly with the target layer, case insensitive")]
         public string QuerySqlFile { get; set; }
 
-        [Option("-Q|--show-query", Description = "Output query to standard output without executing - in this mode no queries are executed and all other queries are suppressed")]
+        [Option("-Q|--show-query", Description = "Output query to standard output without executing - in this mode no external connections are made")]
         public bool OutputQuerySql { get; set; }
 
         [Option("-d|--query-dataset", Description = "Fully-qualified name of the table being queried (if SQL query file is not specified); e.g. geotab-public-intelligence.COVIDMobilityImpact.PortTrafficAnalysis")]
@@ -62,7 +79,6 @@ namespace IgnitionIoTMessagePublisher
         [Option("-L|--arcgis-layer-path", Description = "Path of ArcGIS layer (relative to rest/services) where the incremental records, or all records should be appended")]
         public string ArcGISLayerPath { get; set; }
 
-        // A second output is added to support new use cases
         [Option("-C|--arcgis-recent-path", Description = "Path of an ArcGIS layer (relative to rest/services) to be maintained with only the most recent record for each location")]
         public string ArcGISRecentPath { get; set; }
 
@@ -103,15 +119,22 @@ namespace IgnitionIoTMessagePublisher
         [Option("-Z|--dry-run", Description = "Perform dry run, testing arguments and running the query, still reading all rows, but not producing any output.")]
         public bool DryRun { get; set; }
 
+        //[Option("--http-output-url", Description = "HTTP output URL where JSON features should be posted")]
+        //public string HttpOutputUrl { get; set; }
+
+        //[Option("--http-output-auth", Description = "HTTP output URL where JSON features should be posted")]
+        //public bool HttpOutputToken { get; set; }
+
         [Option("--mqtt-topic", Description = "MQTT topic where JSON features should be published")]
         public string BrokerTopic { get; set; }
 
-        [Option("--mqtt-single", Description = "MQTT single message mode - messages will be sent individually; otherwise they are sent in batches")]
-        public bool BrokerSingleMessage { get; set; }
-
         [Option("--mqtt-broker", Description = "MQTT broker URL, e.g. tcp://localhost:1883")]
-        public string BrokerUrl {
-            get => $"{(BrokerScheme?.Length > 0 ? BrokerScheme + "://" : null)}{BrokerHost}:{BrokerPort}";
+        public string BrokerUrl
+        {
+            get => $@"{(BrokerScheme?.Length > 0 ?
+                BrokerScheme + "://" : null)}{BrokerHost}{(
+                    BrokerPort > 0 ? $":{BrokerPort}" : null)}";
+
             set
             {
                 if (Uri.TryCreate(value, UriKind.Absolute, out var uri))
@@ -134,7 +157,7 @@ namespace IgnitionIoTMessagePublisher
                     }
 
                     BrokerHost = uri.Host;
-                    BrokerPort = (ushort)(!uri.IsDefaultPort && uri.Port > 0 ? 
+                    BrokerPort = (ushort)(!uri.IsDefaultPort && uri.Port > 0 ?
                         uri.Port : BrokerScheme == "mqtts" ? 8883 : 1883);
                 }
                 else
@@ -163,38 +186,31 @@ namespace IgnitionIoTMessagePublisher
         [Option("--mqtt-clean-session", Description = "MQTT clean session option")]
         public bool MqttCleanSession{ get; set; }
 
+        [Option("--mqtt-retain-fanout", Description = "MQTT fanout and retain last message per track - messages will be sent individually, to a subtopic based on the incremental track field, with the retain flag set. If this option is not chosen, the messages are sent in batches to the root topic.")]
+        public bool MqttRetainFanout { get; set; }
+
+        [Option("--mqtt-generic-json", Description = "Use generic JSON rather than ESRI JSON for MQTT output")]
+        public bool MqttGenericJson { get; set; }
+
         #endregion
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
         internal async Task<int> OnExecuteAsync(CommandLineApplication _, CancellationToken ct = default)
         {
             bool deleteOnly = ArcGISDeleteAll && !ArcGISAppendAll;
 
+            // If MQTT will be required, initialize it up-front.
+            // Same for the token for ArcGIS Online, now initialized through PreStorm
+
             if (OutputQuerySql || File.Exists(AccountJsonFile) && !string.IsNullOrEmpty(ProjectId))
             {
+                // disposed in finally block
                 IManagedMqttClient mqttClient = null;
+                TokenProvider tokenProvider = null;
                 PortalGateway portalGateway = null;
+
                 ServiceLayerDescriptionResponse layerDesc = null, recentDesc = null;
+
                 HashSet<string> mainLayerFields = null, recentLayerFields = null;
 
                 var attributeFieldSet = AttributeFields?
@@ -210,7 +226,7 @@ namespace IgnitionIoTMessagePublisher
                         if (!string.IsNullOrWhiteSpace(BrokerTopic))
                         {
                             Console.WriteLine("Attempting connection MQTT hub...");
-                            mqttClient = await ConnectMqttAsync();
+                            mqttClient = await ConnectMqttAsync().ConfigureAwait(false);
                             if (mqttClient == null)
                             {
                                 return 5; // error message already written
@@ -235,11 +251,11 @@ namespace IgnitionIoTMessagePublisher
                                     ArcGISPassword = Prompt.GetPassword($"Supply password for ArcGIS {(IsArcGISServerAuth ? "Server" : "Online")} user {ArcGISUser}: ");
                                 }
 
-                                portalGateway = IsArcGISServerAuth ?
-                                    new PortalGateway(ArcGISRootURL, ArcGISUser, ArcGISPassword) :
-                                    new PortalGateway(ArcGISRootURL, tokenProvider:
-                                        new ArcGISOnlineTokenProvider(ArcGISUser, ArcGISPassword));
+                                tokenProvider = IsArcGISServerAuth ?
+                                    new TokenProvider(ArcGISRootURL, ArcGISUser, ArcGISPassword) :
+                                    new ArcGISOnlineTokenProvider(ArcGISUser, ArcGISPassword);
 
+                                portalGateway = new PortalGateway(ArcGISRootURL, tokenProvider: tokenProvider);
                             }
 
                             portalGateway.HttpRequestTimeout = TimeSpan.FromSeconds(90);
@@ -249,7 +265,7 @@ namespace IgnitionIoTMessagePublisher
                                 try
                                 {
                                     // Credentials are not tested by constructor, but on demand on first use
-                                    layerDesc = await portalGateway.DescribeLayer(ArcGISLayerPath.AsEndpoint());
+                                    layerDesc = await portalGateway.DescribeLayer(ArcGISLayerPath.AsEndpoint()).ConfigureAwait(false);
 
                                     if (layerDesc.Error != null)
                                     {
@@ -275,7 +291,7 @@ namespace IgnitionIoTMessagePublisher
                                 try
                                 {
                                     // Credentials are not tested by constructor, but on demand on first use
-                                    recentDesc = await portalGateway.DescribeLayer(ArcGISRecentPath.AsEndpoint());
+                                    recentDesc = await portalGateway.DescribeLayer(ArcGISRecentPath.AsEndpoint()).ConfigureAwait(false);
 
                                     if (recentDesc.Error != null)
                                     {
@@ -378,6 +394,9 @@ namespace IgnitionIoTMessagePublisher
                         }
                     }
 
+
+
+
                     #region BigQuery request
 
                     BigQueryResults results = null;
@@ -470,7 +489,7 @@ namespace IgnitionIoTMessagePublisher
                         Console.WriteLine("Connecting to BigQuery...");
 
                         var credentials = GoogleCredential.FromFile(AccountJsonFile);
-                        var client = await BigQueryClient.CreateAsync(ProjectId, credentials);
+                        var client = await BigQueryClient.CreateAsync(ProjectId, credentials).ConfigureAwait(false);
 
                         Console.WriteLine("Connected");
 
@@ -479,7 +498,7 @@ namespace IgnitionIoTMessagePublisher
                             Console.WriteLine("Performing SQL query:");
                             Console.WriteLine(sqlQuery);
 
-                            results = await client.ExecuteQueryAsync(sqlQuery, null, null, null, ct);
+                            results = await client.ExecuteQueryAsync(sqlQuery, null, null, null, ct).ConfigureAwait(false);
                         }
                         catch (Exception e)
                         {
@@ -512,95 +531,13 @@ namespace IgnitionIoTMessagePublisher
 
                     if (portalGateway != null || mqttClient != null)
                     {
-                        #region ArcGISDelete
-
                         if (portalGateway != null && ArcGISDeleteAll && !DryRun)
                         {
-                            Console.WriteLine("Deleting existing content from target layer");
-
-                            // todo consider first checking count - beyond a certain point
-                            // it is not worth trying the where clause approach - it would
-                            // not work, or could impose an excessive burden on the server
-
-                            string errorDesc = null;
-
-                            try
+                            var errorStatus = await DeleteAllFromTargetLayer(portalGateway).ConfigureAwait(false);
+                            if (errorStatus != 0)
                             {
-                                var deleteAllResult = await portalGateway.DeleteFeatures(
-                                    new DeleteFeatures(ArcGISLayerPath) { Where = "1=1" });
-
-                                errorDesc = deleteAllResult.Error?.Description;
+                                return errorStatus;
                             }
-                            catch (Exception e)
-                            {
-                                errorDesc = $"Exception - {e}";
-                            }
-
-                            bool hadSuccess = errorDesc == null;
-
-                            if (!hadSuccess)
-                            {
-                                int batchCount = 0;
-                                int successCount = 0;
-                                const int batchSize = 10000;
-
-                                // delete by attributes did not work on a 70,000 record table in ArcGIS Online,
-                                // due to a server-side timeout - not the Anywhere.ArcGIS HttpRequestTimeout
-                                // let's see if we can do better with an OID query and batch deletion
-                                Console.WriteLine(errorDesc);
-                                Console.WriteLine("Deletion of old data failed using catch-all where clause - trying in batches by OID instead");
-
-                                var queryAllOIDsResult = await portalGateway.QueryForIds(
-                                    new QueryForIds(ArcGISLayerPath) { Where = "1=1" });
-
-                                if (queryAllOIDsResult?.ObjectIds?.Length > 0)
-                                {
-                                    for (int offset = 0; offset < queryAllOIDsResult.ObjectIds.Length; offset += batchSize)
-                                    {
-                                        batchCount++;
-
-                                        Console.WriteLine("Deleting batch {0} by OID...", batchCount);
-
-                                        var deleteBatchResult = await portalGateway.DeleteFeatures(
-                                            new DeleteFeatures(ArcGISLayerPath)
-                                            {
-                                                ObjectIds = queryAllOIDsResult.ObjectIds.Skip(offset).Take(batchSize).ToList(),
-                                                RollbackOnFailure = false
-                                            });
-
-                                        //This test gave a false negative; the success flag is not set on a successful delete operation
-                                        if (deleteBatchResult.Error?.Description == null)
-                                        {
-                                            successCount++;
-                                        }
-                                        else
-                                        {
-                                            Console.WriteLine("Warning - deletion by OID did not succeed for batch {0}", batchCount);
-                                        }
-                                    }
-                                }
-
-                                if (successCount < batchCount)
-                                {
-                                    Console.WriteLine("Exiting due to failed deletions in fallback method.{0}",
-                                        successCount > 0 ? " Some batches were successful." : null);
-                                    return 3;
-                                }
-
-                                hadSuccess = successCount > 0;
-                            }
-
-                            var queryCountResult = await portalGateway.QueryForCount(
-                                new QueryForCount(ArcGISLayerPath) { Where = "1=1" });
-
-                            if (queryCountResult.NumberOfResults > 0)
-                            {
-                                Console.WriteLine("Error - records were still present after attempting to delete all. {0}Please try again.",
-                                    hadSuccess ? "Some deletions were successful. " : null);
-                                return 4;
-                            }
-
-                            #endregion
                         }
 
                         // find out which rows were already retrieved so they can be skipped.
@@ -618,52 +555,18 @@ namespace IgnitionIoTMessagePublisher
                             {
                                 if (recentLayerFields != null && IncrementalBaseOnRecent)
                                 {
-                                    if (recentLayerFields.TryGetValue(IncrementalLatestField, out var recentLatest)
-                                        && recentLayerFields.TryGetValue(IncrementalTrackField, out var recentTrack))
-                                    {
-                                        var queryResult = await portalGateway.Query<Extent>(
-                                            new Query(ArcGISRecentPath)
-                                            {
-                                                OutFields = new List<string> { recentTrack, recentLatest }
-                                            });
-
-                                        latestByTrack = queryResult.Features?.ToDictionary(
-                                            feature => feature.Attributes[recentTrack],
-                                            feature => feature.Attributes[recentLatest]);
-                                    }
-                                    else
-                                    {
-                                        // should not actually occur - field names are pre-validated (case insensitive)
-                                        Console.WriteLine("Error - a suitable basis for incremental updates could not be determined from the 'recent' layer. Aborting without any changes.");
-                                        return 5;
-                                    }
+                                    latestByTrack = await RetrieveLatestByTrack(portalGateway,
+                                        ArcGISRecentPath, recentLayerFields, true).ConfigureAwait(false);
                                 }
-                                else if (mainLayerFields != null
-                                    && mainLayerFields.TryGetValue(IncrementalLatestField, out var mainLatest)
-                                    && mainLayerFields.TryGetValue(IncrementalTrackField, out var mainTrack))
+                                else if (mainLayerFields != null)
                                 {
-                                    //Extent can be used as a dummy indicator for non-geometric queries
-                                    var queryResult = await portalGateway.Query<Extent>(new Query(ArcGISLayerPath)
-                                    {
-                                        GroupByFields = new List<string>(1) { mainTrack },
-                                        OutputStatistics = new List<OutputStatistic>(1)
-                                    {
-                                        new OutputStatistic()
-                                        {
-                                            OnField = mainLatest,
-                                            OutField = "RangeMax",
-                                            StatisticType = "max"
-                                        }
-                                    }
-                                    });
-
-                                    latestByTrack = queryResult.Features?.ToDictionary(
-                                        feature => feature.Attributes[mainTrack],
-                                        feature => feature.Attributes["RangeMax"]);
+                                    latestByTrack = await RetrieveLatestByTrack(portalGateway,
+                                        ArcGISLayerPath, mainLayerFields, false).ConfigureAwait(false);
                                 }
-                                else
+
+                                if (latestByTrack == null)
                                 {
-                                    Console.WriteLine("Error - a suitable basis for incremental updates could not be determined from the main output layer. Aborting without any changes.");
+                                    Console.WriteLine("Error - a suitable basis for incremental updates could not be determined. Aborting without any changes.");
                                     return 5;
                                 }
                             }
@@ -685,7 +588,7 @@ namespace IgnitionIoTMessagePublisher
                                     }
                                 }
 
-                                if (mqttClient != null && BrokerSingleMessage)
+                                if (mqttClient != null && MqttRetainFanout)
                                 {
                                     Console.WriteLine("Individual messages will be sent to broker topic {0}/track-value", BrokerTopic);
                                 }
@@ -698,7 +601,8 @@ namespace IgnitionIoTMessagePublisher
                                 var recentFeatures = recentLayerFields != null ?
                                     new Dictionary<object, Feature<Point>>() : null;
 
-                                var features = mainLayerFields != null || (mqttClient != null && !BrokerSingleMessage) ? new List<Feature<Point>>() : null;
+                                var features = mainLayerFields != null || (mqttClient != null && !MqttRetainFanout) ? new List<Feature<Point>>() : null;
+                                // TODO - keep a separate buffer of MQTT features; always use source field names with exact case as specified
 
                                 if (resultFields.TryGetValue(IncrementalLatestField, out var resultLatest) && resultFields.TryGetValue(IncrementalTrackField, out var resultTrack))
                                 {
@@ -750,13 +654,13 @@ namespace IgnitionIoTMessagePublisher
                                             {
                                                 var pointGeom = new Point()
                                                 {
-                                                    X = Convert.ToDouble(row[resultLon]),
-                                                    Y = Convert.ToDouble(row[resultLat]),
+                                                    X = Convert.ToDouble(row[resultLon], CultureInfo.InvariantCulture),
+                                                    Y = Convert.ToDouble(row[resultLat], CultureInfo.InvariantCulture),
 
                                                     SpatialReference = SpatialReference.WGS84
                                                 };
 
-                                                if (feat != null && (mqttClient != null || layerDesc.GeometryTypeString == "esriGeometryPoint"))
+                                                if (feat != null && (mqttClient != null || layerDesc?.GeometryTypeString == "esriGeometryPoint"))
                                                 {
                                                     feat.Geometry = pointGeom;
                                                 }
@@ -767,7 +671,9 @@ namespace IgnitionIoTMessagePublisher
                                                 }
                                             }
 
-                                            if (feat != null && mqttClient != null && BrokerSingleMessage && !DryRun)
+                                            // retain and fanout are coupled, because retain would not
+                                            // make sense for most purposes unless fanned out
+                                            if (feat != null && mqttClient != null && MqttRetainFanout && !DryRun)
                                             {
                                                 // send results through to MQTT - warn but don't stop if it fails
                                                 try
@@ -777,8 +683,8 @@ namespace IgnitionIoTMessagePublisher
                                                             .WithTopic($"{BrokerTopic}/{currentTrack}")
                                                             .WithAtMostOnceQoS()
                                                             .WithRetainFlag(true)
-                                                            .WithPayload(JsonConvert.SerializeObject(feat))
-                                                                .Build());
+                                                            .WithPayload(SerializeEntity(feat, MqttGenericJson))
+                                                                .Build()).ConfigureAwait(false);
 
                                                     if (result.ReasonCode != MqttClientPublishReasonCode.Success)
                                                     {
@@ -802,18 +708,21 @@ namespace IgnitionIoTMessagePublisher
                                                 {
                                                     if (!DryRun)
                                                     {
-                                                        if (mqttClient != null && !BrokerSingleMessage)
+                                                        if (mqttClient != null && !MqttRetainFanout)
                                                         {
                                                             // fire and forget
                                                             try
                                                             {
+                                                                string payload = string.Join("\n",
+                                                                    features.Select(f => SerializeEntity(f, MqttGenericJson)));
+
                                                                 var result = await mqttClient.PublishAsync(
                                                                     new MqttApplicationMessageBuilder()
                                                                         .WithTopic(BrokerTopic)
                                                                         .WithAtMostOnceQoS()
                                                                         .WithRetainFlag(false)
-                                                                        .WithPayload(JsonConvert.SerializeObject(features))
-                                                                            .Build());
+                                                                        .WithPayload(payload)
+                                                                            .Build()).ConfigureAwait(false);
 
                                                                 if (result.ReasonCode != MqttClientPublishReasonCode.Success)
                                                                 {
@@ -831,6 +740,8 @@ namespace IgnitionIoTMessagePublisher
                                                         if (portalGateway != null && layerDesc != null)
                                                         {
                                                             // clear geometry as it was only included on the features for the MQTT output
+                                                            // TODO the extra memory it would take to keep a duplicate copy would be a
+                                                            // worthwhile trade to save this book keeping.
                                                             if (mqttClient != null && layerDesc.GeometryTypeString != "esriGeometryPoint")
                                                             {
                                                                 foreach (var f in features)
@@ -839,14 +750,25 @@ namespace IgnitionIoTMessagePublisher
                                                                 }
                                                             }
 
-                                                            var batchAppendResult = await portalGateway.ApplyEdits(
-                                                            new ApplyEdits<Point>(ArcGISLayerPath) { Adds = features });
+                                                            try
+                                                            {
+                                                                var batchAppendResult = await portalGateway.ApplyEdits(
+                                                                    new ApplyEdits<Point>(ArcGISLayerPath.AsEndpoint())
+                                                                    {
+                                                                        Adds = features,
+                                                                        RollbackOnFailure = true
+                                                                        
+                                                                    }).ConfigureAwait(false);
 
-                                                            totalAppended += batchAppendResult.ActualAddsThatSucceeded;
-                                                            totalAttempted += batchAppendResult.ActualAdds;
+                                                                totalAppended += batchAppendResult.ActualAddsThatSucceeded;
+                                                                totalAttempted += batchAppendResult.ActualAdds;
+                                                            }
+                                                            catch (JsonReaderException e) when (IsInvalidJsonResponse(e))
+                                                            {
+                                                                Console.WriteLine("Invalid JSON response - {0}", e.Message);
+                                                                totalAttempted += features.Count;
+                                                            }
                                                         }
-
-
                                                     }
 
                                                     Console.WriteLine("Batch {0} completed...{1}", ++batchCount,
@@ -855,7 +777,6 @@ namespace IgnitionIoTMessagePublisher
                                                     features.Clear();
                                                 }
                                             }
-
                                         }
                                         else
                                         {
@@ -874,7 +795,7 @@ namespace IgnitionIoTMessagePublisher
                                         // it still needs to scan the data in order to filter it
                                         // out) but there is a query analyzer that can estimate
                                         // that. There would also be the challenge of merging a
-                                        // system-generated where clause in an user-defined query.
+                                        // system-generated where clause in a user-defined query
                                     }
                                 }
 
@@ -882,9 +803,12 @@ namespace IgnitionIoTMessagePublisher
                                 {
                                     if (!DryRun)
                                     {
-                                        if (mqttClient != null && !BrokerSingleMessage)
+                                        if (mqttClient != null && !MqttRetainFanout)
                                         {
                                             // fire and forget
+                                            string payload = string.Join("\n",
+                                                features.Select(f => SerializeEntity(f, MqttGenericJson)));
+
                                             try
                                             {
                                                 var result = await mqttClient.PublishAsync(
@@ -892,8 +816,8 @@ namespace IgnitionIoTMessagePublisher
                                                         .WithTopic(BrokerTopic)
                                                         .WithAtMostOnceQoS()
                                                         .WithRetainFlag(false)
-                                                        .WithPayload(JsonConvert.SerializeObject(features))
-                                                            .Build());
+                                                        .WithPayload(payload)
+                                                            .Build()).ConfigureAwait(false);
 
                                                 if (result.ReasonCode != MqttClientPublishReasonCode.Success)
                                                 {
@@ -919,11 +843,23 @@ namespace IgnitionIoTMessagePublisher
                                                 }
                                             }
 
-                                            var batchAppendResult = await portalGateway.ApplyEdits(
-                                                new ApplyEdits<Point>(ArcGISLayerPath) { Adds = features });
+                                            try
+                                            {
+                                                var batchAppendResult = await portalGateway.ApplyEdits(
+                                                    new ApplyEdits<Point>(ArcGISLayerPath)
+                                                    {
+                                                        Adds = features,
+                                                        RollbackOnFailure = false
+                                                    }).ConfigureAwait(false);
 
-                                            totalAppended += batchAppendResult.ActualAddsThatSucceeded;
-                                            totalAttempted += batchAppendResult.ActualAdds;
+                                                totalAppended += batchAppendResult.ActualAddsThatSucceeded;
+                                                totalAttempted += batchAppendResult.ActualAdds;
+                                            }
+                                            catch (JsonReaderException e) when (IsInvalidJsonResponse(e))
+                                            {
+                                                Console.WriteLine("Invalid JSON response - {0}", e.Message);
+                                                totalAttempted += features.Count;
+                                            }
                                         }
 
                                     }
@@ -936,40 +872,9 @@ namespace IgnitionIoTMessagePublisher
 
                                 if (skippedExistingRecords > 0)
                                 {
-                                    Console.WriteLine("Skipped {0} existing records with based on incremental query results.",
+                                    Console.WriteLine("Skipped {0} existing records with {1} remaining, based on incremental query results.",
                                         skippedExistingRecords, totalRows - skippedExistingRecords);
                                 }
-
-                                // Moved into loop above to conserve memory
-                                //if (features != null)
-                                //{
-                                //    while (features.Count > batchSize)
-                                //    {
-                                //        var batchApplyEdits = new ApplyEdits<Point>(ArcGISLayerPath)
-                                //        {
-                                //            Adds = features.Take(batchSize).ToList()
-                                //        };
-
-
-                                //        var batchAppendResult = await portalGateway.ApplyEdits(batchApplyEdits);
-                                //        totalAppended += batchAppendResult.ActualAddsThatSucceeded;
-                                //        totalAttempted += batchAppendResult.ActualAdds;
-
-                                //        Console.WriteLine("Batch {0} completed...", ++batchCount);
-
-                                //        features.RemoveRange(0, batchSize);
-                                //    }
-
-                                //    var finalApplyEdits = new ApplyEdits<Point>(ArcGISLayerPath) { Adds = features };
-                                //    var finalAppendResult = await portalGateway.ApplyEdits(finalApplyEdits);
-
-                                //    totalAppended += finalAppendResult.ActualAddsThatSucceeded;
-                                //    totalAttempted += finalAppendResult.ActualAdds;
-
-                                //    Console.WriteLine("Done - {0} of {1} records appended successfully",
-                                //        totalAppended, totalAttempted);
-                                //}
-
 
                                 if (portalGateway != null && recentFeatures?.Count > 0)
                                 {
@@ -994,7 +899,7 @@ namespace IgnitionIoTMessagePublisher
                                                 recentTrack,
                                                 recentLatest
                                                 }
-                                            });
+                                            }).ConfigureAwait(false);
 
                                         var recentUpdates = new List<Feature<Point>>();
 
@@ -1014,21 +919,56 @@ namespace IgnitionIoTMessagePublisher
 
                                         if (!DryRun)
                                         {
-                                            var batchAppendResult = await portalGateway.ApplyEdits(
-                                            new ApplyEdits<Point>(ArcGISRecentPath)
-                                            {
-                                                Adds = recentFeatures.Values.ToList(),
-                                                Updates = recentUpdates
-                                            });
+                                            // If there are more tracks than the batch size, chop it up.
+                                            var recentAdds = recentFeatures.Values.ToList();
 
+                                            var recentAddsTotal = recentAdds.Count;
+                                            var recentUpdatesTotal = recentUpdates.Count;
+                                            int recentAddsResult = 0;
+                                            int recentUpdatesResult = 0;
 
-                                            if (batchAppendResult.ActualAddsThatSucceeded < recentFeatures.Count ||
-                                                batchAppendResult.ActualUpdatesThatSucceeded < recentUpdates.Count)
+                                            int recentBatch = 0;
+
+                                            while (recentAdds.Count + recentUpdates.Count > 0)
                                             {
-                                                Console.WriteLine("Warining - some additions or updates to the 'recent' layer failed");
+                                                var adds = recentAdds.Count > batchSize ?
+                                                recentAdds.Take(batchSize).ToList() : recentAdds;
+
+                                                var updates = recentUpdates.Count > batchSize ?
+                                                    recentUpdates.Take(batchSize).ToList() : recentUpdates;
+
+                                                try
+                                                {
+                                                    var recentEditsResult = await portalGateway.ApplyEdits(
+                                                        new ApplyEdits<Point>(ArcGISRecentPath)
+                                                        {
+                                                            Adds = adds,
+                                                            Updates = updates,
+                                                            RollbackOnFailure = false
+                                                        }).ConfigureAwait(false);
+
+                                                    recentAddsResult += recentEditsResult.ActualAddsThatSucceeded;
+                                                    recentUpdatesResult += recentEditsResult.ActualUpdatesThatSucceeded;
+
+                                                    Console.WriteLine("Recent features batch {0} ({1} adds, {2} updates) completed...",
+                                                        ++recentBatch, adds.Count, updates.Count);
+                                                }
+                                                catch (JsonReaderException e) when (IsInvalidJsonResponse(e))
+                                                {
+                                                    Console.WriteLine("Invalid JSON response for recent features batch {0} - {1}", ++recentBatch, e.Message);
+                                                }
+
+                                                recentAdds.RemoveRange(0, adds.Count);
+                                                recentUpdates.RemoveRange(0, updates.Count);
+                                            }
+
+                                            if (recentAddsResult < recentAddsTotal ||
+                                                recentUpdatesResult < recentUpdatesTotal)
+                                            {
+                                                Console.WriteLine("Warning - some additions or updates to the 'recent' layer failed");
                                                 Console.WriteLine(" * edits succesful for {0} of {1} adds, {2} of {3} updates",
-                                                    batchAppendResult.ActualAddsThatSucceeded, recentFeatures.Count,
-                                                    batchAppendResult.ActualUpdatesThatSucceeded, recentUpdates.Count);
+                                                    recentAddsResult, recentAddsTotal,
+                                                    recentUpdatesResult, recentUpdatesTotal);
                                             }
                                         }
                                     }
@@ -1044,6 +984,7 @@ namespace IgnitionIoTMessagePublisher
                 {
                     mqttClient?.Dispose();
                     portalGateway?.Dispose();
+                    tokenProvider?.Dispose();
                 }
 
             }
@@ -1055,6 +996,148 @@ namespace IgnitionIoTMessagePublisher
             Console.WriteLine("Press any key to continue...");
             Console.ReadKey();
             return 1;
+        }
+
+        private static bool IsInvalidJsonResponse(JsonReaderException e)
+        {
+            return e.Message.StartsWith("Unexpected character encountered while parsing ",
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private async Task<Dictionary<object,object>> RetrieveLatestByTrack(PortalGateway portalGateway,
+            string layerPath, HashSet<string> layerFields, bool assumeLayerHasMostRecentOnly)
+        {
+            if (layerFields.TryGetValue(IncrementalLatestField, out var latestField)
+                && layerFields.TryGetValue(IncrementalTrackField, out var trackField))
+            {
+                if (assumeLayerHasMostRecentOnly)
+                {
+                    var queryResult = await portalGateway.Query<Extent>(
+                        new Query(layerPath)
+                        {
+                            OutFields = new List<string> { trackField, latestField }
+                        }).ConfigureAwait(false);
+
+                    return queryResult.Features?.ToDictionary(
+                        feature => feature.Attributes[trackField],
+                        feature => feature.Attributes[latestField]);
+                }
+                else
+                {
+                    //Extent can be used as a dummy indicator for non-geometric queries
+                    var queryResult = await portalGateway.Query<Extent>(new Query(layerPath)
+                    {
+                        GroupByFields = new List<string>(1) { trackField },
+                        OutputStatistics = new List<OutputStatistic>(1)
+                        {
+                            new OutputStatistic()
+                            {
+                                OnField = latestField,
+                                OutField = "RangeMax",
+                                StatisticType = "max"
+                            }
+                        }
+                    }).ConfigureAwait(false);
+
+                    return queryResult.Features?.ToDictionary(
+                        feature => feature.Attributes[trackField],
+                        feature => feature.Attributes["RangeMax"]);
+                }
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        private async Task<int> DeleteAllFromTargetLayer(PortalGateway portalGateway)
+        {
+            Console.WriteLine("Deleting existing content from target layer");
+
+            // todo consider first checking count - beyond a certain point
+            // it is not worth trying the where clause approach - it would
+            // not work, or could impose an excessive burden on the server
+
+            string errorDesc = null;
+
+            try
+            {
+                var deleteAllResult = await portalGateway.DeleteFeatures(
+                    new DeleteFeatures(ArcGISLayerPath) { Where = "1=1" }).ConfigureAwait(false);
+
+                errorDesc = deleteAllResult.Error?.Description;
+            }
+            catch (Exception e)
+            {
+                errorDesc = $"Exception - {e.Message}";
+            }
+
+            bool hadSuccess = errorDesc == null;
+
+            if (!hadSuccess)
+            {
+                int batchCount = 0;
+                int successCount = 0;
+                const int batchSize = 2000;
+
+                // delete by attributes did not work on a 70,000 record table in ArcGIS Online,
+                // due to a server-side timeout - not the Anywhere.ArcGIS HttpRequestTimeout
+                // let's see if we can do better with an OID query and batch deletion
+
+                Console.WriteLine(errorDesc);
+                Console.WriteLine("Deletion of old data failed using catch-all where clause - trying in batches by OID instead");
+
+                var queryAllOIDsResult = await portalGateway.QueryForIds(
+                    new QueryForIds(ArcGISLayerPath) { Where = "1=1" }).ConfigureAwait(false);
+
+                if (queryAllOIDsResult?.ObjectIds?.Length > 0)
+                {
+                    for (int offset = 0; offset < queryAllOIDsResult.ObjectIds.Length; offset += batchSize)
+                    {
+                        batchCount++;
+
+                        Console.WriteLine("Deleting batch {0} by OID...", batchCount);
+
+                        var deleteBatchResult = await portalGateway.DeleteFeatures(
+                            new DeleteFeatures(ArcGISLayerPath)
+                            {
+                                ObjectIds = queryAllOIDsResult.ObjectIds.Skip(offset).Take(batchSize).ToList(),
+                                RollbackOnFailure = false
+                            }).ConfigureAwait(false);
+
+                        //This test gave a false negative; the success flag is not set on a successful delete operation
+                        if (deleteBatchResult.Error?.Description == null)
+                        {
+                            successCount++;
+                        }
+                        else
+                        {
+                            Console.WriteLine("Warning - deletion by OID did not succeed for batch {0}", batchCount);
+                        }
+                    }
+                }
+
+                if (successCount < batchCount)
+                {
+                    Console.WriteLine("Exiting due to failed deletions in fallback method.{0}",
+                        successCount > 0 ? " Some batches were successful." : null);
+                    return 3;
+                }
+
+                hadSuccess = successCount > 0;
+            }
+
+            var queryCountResult = await portalGateway.QueryForCount(
+                new QueryForCount(ArcGISLayerPath) { Where = "1=1" }).ConfigureAwait(false);
+
+            if (queryCountResult.NumberOfResults > 0)
+            {
+                Console.WriteLine("Error - records were still present after attempting to delete all. {0}Please try again.",
+                    hadSuccess ? "Some deletions were successful. " : null);
+                return 4;
+            }
+
+            return 0;
         }
 
         static int CompareIncrementalValues(object v1, object v2)
@@ -1071,7 +1154,7 @@ namespace IgnitionIoTMessagePublisher
             }
             else
             {
-                return Convert.ToDouble(v1).CompareTo(Convert.ToDouble(v2)); // works for most mismatched numeric types
+                return Convert.ToDouble(v1, CultureInfo.InvariantCulture).CompareTo(Convert.ToDouble(v2, CultureInfo.InvariantCulture)); // works for most mismatched numeric types
             }
         }
 
@@ -1088,6 +1171,43 @@ namespace IgnitionIoTMessagePublisher
                 ) : fields).Select(f => f.Name), StringComparer.OrdinalIgnoreCase) : null;
 
 
+        JsonSerializerSettings jsonOmitNull;
+        string SerializeEntity(Feature<Point> feat, bool generic = false, bool indent = false)
+        {
+
+            if (generic)
+            {
+                if (feat.Geometry is Point point)
+                {
+                    var attribs = new Dictionary<string, object>(feat.Attributes);
+                    attribs[LongitudeField] = point.X;
+                    attribs[LatitudeField] = point.Y;
+                    return JsonConvert.SerializeObject(attribs, indent ? Formatting.Indented :
+                        Formatting.None);
+                }
+                else
+                {
+                    return JsonConvert.SerializeObject(feat.Attributes, indent ? Formatting.Indented :
+                        Formatting.None);
+                }
+            }
+            else
+            {
+                // default serialization attributes supplied by Anywhere.ArcGIS result in a
+                // nearly compliant esri JSON format accepted by Server, Portal, and Online,
+                // converting DateTime values to an ISO string instead of epoch milliseconds
+                // - applying NullValueHandling.Ignore, as Anywhere.ArcGIS does internally,
+                //   declutters the spatialReference and omits Geometry if null, since
+                //   EmitDefaultValue was not specified in the DataContract attributes
+
+                return JsonConvert.SerializeObject(feat,
+                    indent ? Formatting.Indented : Formatting.None,
+                        jsonOmitNull ??= new JsonSerializerSettings
+                        {
+                            NullValueHandling = NullValueHandling.Ignore
+                        });
+            }
+        }
 
         private async Task<IManagedMqttClient> ConnectMqttAsync()
         {
@@ -1121,8 +1241,7 @@ namespace IgnitionIoTMessagePublisher
                 clientOptionsBuilder = clientOptionsBuilder.WithTls(
                     new MqttClientOptionsBuilderTlsParameters {
                         UseTls = true,
-                        CertificateValidationCallback = (X509Certificate x, X509Chain y, SslPolicyErrors z, IMqttClientOptions o) =>
-                        {
+                        CertificateValidationHandler = context => {
                             // TODO: Check conditions of certificate by using above parameters.
                             return true;
                         }
@@ -1141,9 +1260,9 @@ namespace IgnitionIoTMessagePublisher
                 var connected = new TaskCompletionSource<bool>();
                 mqttClient.ConnectedHandler = new MqttClientConnectedHandlerDelegate(e => connected.SetResult(true));
 
-                await mqttClient.StartAsync(options);
+                await mqttClient.StartAsync(options).ConfigureAwait(false);
 
-                await connected.Task;
+                await connected.Task.ConfigureAwait(false);
                 mqttClient.ConnectedHandler = null;
 
                 return mqttClient;
@@ -1156,7 +1275,7 @@ namespace IgnitionIoTMessagePublisher
         }
         static async Task<int> Main(string[] args)
         {
-            var statusCode = await CommandLineApplication.ExecuteAsync<Program>(args);
+            var statusCode = await CommandLineApplication.ExecuteAsync<Program>(args).ConfigureAwait(false);
             return statusCode;  // set breakpoint here to see messages for bad args
         }
         //was static Task<int> Main(string[] args) => CommandLineApplication.ExecuteAsync<Program>(args);
